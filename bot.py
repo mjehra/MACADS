@@ -1,405 +1,684 @@
 import os
+import logging
 import asyncio
-from datetime import datetime
-from telethon.sync import TelegramClient
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
-from telethon import events
-from telethon.tl.types import MessageEntityCustomEmoji
+from telethon import TelegramClient, errors, events
+from telethon.tl.types import Channel, Chat
+from telethon.tl.custom import Button
+import random
+import re
 
-# Configuration
-API_ID = 29533823
-API_HASH = '10b6a27b83b3e90aca70de60c4bd7013'
-PHONE_NUMBER = '+8801747997105'
-BOT_TOKEN = '7881140222:AAF6qLrvpaw6xF2NSlawGLr8y-ZDcnc3eSY'
-AUTHORIZED_CHAT_IDS = [7384747527]  # Your chat ID
+BOT_TOKEN = "7768959332:AAHYhsJr-y9DL2kqSmCX4NbxuF-DXxAUb3I"
+ADMIN_IDS = [7655644665]
+API_ID = 29938230
+API_HASH = "95feafa9424ee78571f24fc742674cd5"
+PHONE_NUMBER = "+923155955000"
+SESSION_FILE = "user_account1.session"
+SEND_INTERVAL = 5
 
-class BroadcastBot:
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logging.getLogger("telethon").setLevel(level=logging.CRITICAL)
+
+class TelegramBot:
     def __init__(self):
-        self.session_files = {
-            'user': 'user_session.session',
-            'bot': 'bot_session.session'
-        }
-        self.cleanup_sessions()
+        os.system("cls" if os.name == 'nt' else "clear")
         
-        self.user_client = None
-        self.bot_client = None
-        self.broadcast_active = False
-        self.stop_requested = False
-        self.current_message = None
-        self.current_media = None
-        self.current_entities = None
-        self.delay_seconds = 15
-        self.successful = []
-        self.failed = []
-        self.me = None
-        self.current_flood_wait = 0
-        self.last_command_time = {}
-        self.cooldown = 5
-        self.admins = AUTHORIZED_CHAT_IDS.copy()
-        self.owner_id = AUTHORIZED_CHAT_IDS[0]
+        self.bot = TelegramClient(
+            session="bot_session",
+            api_id=API_ID,
+            api_hash=API_HASH
+        ).start(bot_token=BOT_TOKEN)
+        
+        self.user_client = TelegramClient(
+            session=SESSION_FILE,
+            api_id=API_ID,
+            api_hash=API_HASH
+        )
+        
+        self.groups = set()
+        self.running = False
+        self.user = None
+        self.message_to_forward = None  # Will store (chat_id, message_id)
+        self.profile_photo = None
+        self.authorized_users = set(ADMIN_IDS)
+        self.stats = {
+            'total_groups': 0,
+            'successful_forwards': 0,
+            'failed_forwards': 0,
+            'last_forwarded_group': None,
+            'original_message_views': 0,
+            'original_message_link': None
+        }
+        self.stats_message = None
+        self.user_state = {}  # To track user's current state
+        self.initialized = False  # To track if user client is logged in
+        
+        # Register event handlers
+        self.bot.add_event_handler(self.handle_start, events.NewMessage(pattern='/start'))
+        self.bot.add_event_handler(self.handle_main, events.NewMessage(pattern='/main'))
+        self.bot.add_event_handler(self.handle_callback, events.CallbackQuery())
+        self.bot.add_event_handler(self.handle_set_message_link, events.NewMessage())
+        self.bot.add_event_handler(self.handle_admin_commands, events.NewMessage(pattern='/admin'))
+        self.bot.add_event_handler(self.handle_set_photo, events.NewMessage(func=lambda e: e.photo))
 
-    def cleanup_sessions(self):
-        """Clean up old session files"""
-        for session in self.session_files.values():
-            if os.path.exists(session):
-                try:
-                    os.remove(session)
-                except:
-                    pass
+    async def connect_user_client(self):
+        """Connect and authenticate the user client"""
+        if not os.path.exists(SESSION_FILE):
+            logging.info("Creating new session file")
+        
+        await self.user_client.connect()
+        
+        if not await self.user_client.is_user_authorized():
+            logging.info("User not authorized. Starting login process...")
+            await self.bot.send_message(ADMIN_IDS[0], "🔑 Starting login process for user account...")
+            
+            try:
+                await self.user_client.send_code_request(PHONE_NUMBER)
+                logging.info("Sent verification code")
+                await self.bot.send_message(ADMIN_IDS[0], "📲 Verification code sent. Please check your Telegram app.")
+                
+                # Wait for code input from admin
+                self.user_state[ADMIN_IDS[0]] = "awaiting_code"
+                return False
+            except Exception as e:
+                logging.error(f"Error sending code request: {str(e)}")
+                await self.bot.send_message(ADMIN_IDS[0], f"❌ Error sending code: {str(e)}")
+                return False
+        
+        self.user = await self.user_client.get_me()
+        logging.info(f"Logged in as: {self.user.username}")
+        await self.bot.send_message(ADMIN_IDS[0], f"✅ Successfully logged in as: @{self.user.username}")
+        self.initialized = True
+        return True
 
-    def is_authorized(self, chat_id):
-        """Check if user is authorized"""
-        return chat_id in self.admins
-
-    async def safe_send(self, target, message=None, file=None, entities=None):
-        """Send message with flood control"""
+    async def complete_login(self, code):
+        """Complete the login process with verification code"""
         try:
-            if file:
-                await self.user_client.send_file(
-                    target, 
-                    file, 
-                    caption=message,
-                    parse_mode='html',
-                    formatting_entities=entities
-                )
-            else:
-                await self.user_client.send_message(
-                    target,
-                    message,
-                    parse_mode='html',
-                    formatting_entities=entities
-                )
+            await self.user_client.sign_in(PHONE_NUMBER, code)
+            self.user_client.session.save()
+            self.user = await self.user_client.get_me()
+            logging.info(f"Logged in as: {self.user.username}")
+            await self.bot.send_message(ADMIN_IDS[0], f"✅ Successfully logged in as: @{self.user.username}")
+            self.initialized = True
             return True
-        except FloodWaitError as e:
-            wait = e.seconds
-            print(f"Flood wait: {wait} seconds")
-            self.current_flood_wait = wait
-            await asyncio.sleep(wait)
-            return await self.safe_send(target, message, file, entities)
+        except errors.SessionPasswordNeededError:
+            await self.bot.send_message(ADMIN_IDS[0], "🔒 Account has 2FA. Please enter your password:")
+            self.user_state[ADMIN_IDS[0]] = "awaiting_password"
+            return False
         except Exception as e:
-            print(f"Send error: {e}")
+            logging.error(f"Login error: {str(e)}")
+            await self.bot.send_message(ADMIN_IDS[0], f"❌ Login failed: {str(e)}")
             return False
 
-    async def initialize(self):
-        """Initialize the bot"""
-        print("Starting Premium Broadcast Bot... ✨")
-        
+    async def complete_2fa(self, password):
+        """Complete 2FA authentication"""
         try:
-            # Initialize user client
-            self.user_client = TelegramClient(
-                self.session_files['user'], 
-                API_ID, 
-                API_HASH
-            )
-            await self.user_client.start(phone=PHONE_NUMBER)
-            
-            self.me = await self.user_client.get_me()
-            print(f"User connected: {self.me.first_name}")
-            
-            # Initialize bot client
-            self.bot_client = TelegramClient(
-                self.session_files['bot'],
-                API_ID,
-                API_HASH
-            )
-            await self.bot_client.start(bot_token=BOT_TOKEN)
-            
-            self.setup_handlers()
-            print("Bot is ready. Send /start to begin. ✨")
-            await self.bot_client.run_until_disconnected()
-            
+            await self.user_client.sign_in(password=password)
+            self.user_client.session.save()
+            self.user = await self.user_client.get_me()
+            logging.info(f"Logged in as: {self.user.username}")
+            await self.bot.send_message(ADMIN_IDS[0], f" Account connected successfully! [ @GODCARING ]")
+            self.initialized = True
+            return True
         except Exception as e:
-            print(f"Fatal error: {e}")
-            await self.safe_shutdown()
+            logging.error(f"2FA error: {str(e)}")
+            await self.bot.send_message(ADMIN_IDS[0], f" 2FA failed: {str(e)}")
+            return False
 
-    async def safe_shutdown(self):
-        """Proper shutdown procedure"""
+    async def get_all_groups(self):
         try:
-            if self.user_client:
-                await self.user_client.disconnect()
-            if self.bot_client:
-                await self.bot_client.disconnect()
+            dialogs = await self.user_client.get_dialogs()
+            valid_chats = []
+            
+            for dialog in dialogs:
+                entity = dialog.entity
+                
+                if isinstance(entity, Chat) or (isinstance(entity, Channel) and entity.megagroup):
+                    valid_chats.append({
+                        'id': dialog.id,
+                        'title': dialog.title,
+                        'type': 'Supergroup' if isinstance(entity, Channel) else 'Group',
+                        'entity': entity
+                    })
+            
+            self.stats['total_groups'] = len(valid_chats)
+            return valid_chats
         except Exception as e:
-            print(f"Shutdown error: {e}")
+            logging.error(f"Error getting groups: {str(e)}")
+            return []
 
-    def check_cooldown(self, user_id):
-        """Prevent command spamming"""
-        now = datetime.now().timestamp()
-        if user_id in self.last_command_time:
-            if now - self.last_command_time[user_id] < self.cooldown:
-                return True
-        self.last_command_time[user_id] = now
-        return False
-
-    def setup_handlers(self):
-        """Setup all command handlers"""
-        
-        @self.bot_client.on(events.NewMessage(pattern='/start'))
-        async def start_handler(event):
-            if not self.is_authorized(event.sender_id):
-                await event.respond("❌ You are not authorized! ✨")
-                return
-                
-            if self.check_cooldown(event.sender_id):
-                return
-                
-            await event.respond(
-                "𝐌𝐄𝐍𝐔 𝐎𝐅 𝐑𝐃𝐇 𝐓𝐄𝐋𝐄𝐆𝐑𝐀𝐌 𝐁𝐎𝐓\n\n"
-                "1. Send your message (text/media)\n"
-                "2. Use /send to broadcast\n\n"
-                "📜 Commands:\n"
-                "/start - Show this help\n"
-                "/send - Start broadcast\n"
-                "/stop - Cancel broadcast\n"
-                "/status - Check progress\n"
-                "/addadmin [ID] - Add new admin\n"
-                "/removeadmin [ID] - Remove admin\n"
-                "/listadmins - Show all admins\n\n"
-                "⚠WAIT ATLEAST 2-5 SECONDS"
-            )
-
-        @self.bot_client.on(events.NewMessage(pattern='/addadmin'))
-        async def add_admin_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            if event.sender_id != self.owner_id:
-                await event.respond("❌ Only owner can add admins! ✨")
-                return
-                
-            try:
-                args = event.message.text.split()
-                if len(args) < 2:
-                    await event.respond("Usage: /addadmin [user_id] ✨")
-                    return
-                    
-                new_admin = int(args[1])
-                if new_admin not in self.admins:
-                    self.admins.append(new_admin)
-                    await event.respond(f"✅ Added admin with ID: {new_admin} ✨✨✨")
-                    print(f"New admin added: {new_admin}")
-                else:
-                    await event.respond("ℹ User is already an admin ✨")
-            except (IndexError, ValueError):
-                await event.respond("Usage: /addadmin [user_id] ✨")
-
-        @self.bot_client.on(events.NewMessage(pattern='/removeadmin'))
-        async def remove_admin_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            if event.sender_id != self.owner_id:
-                await event.respond("❌ Only owner can remove admins! ✨")
-                return
-                
-            try:
-                args = event.message.text.split()
-                if len(args) < 2:
-                    await event.respond("Usage: /removeadmin [user_id]")
-                    return
-                    
-                admin_to_remove = int(args[1])
-                if admin_to_remove in self.admins:
-                    if admin_to_remove == self.owner_id:
-                        await event.respond("❌ Cannot remove the owner! ✨")
-                    else:
-                        self.admins.remove(admin_to_remove)
-                        await event.respond(f"✅ Removed admin with ID: {admin_to_remove}")
-                        print(f"Admin removed: {admin_to_remove}")
-                else:
-                    await event.respond("ℹ User is not an admin")
-            except (IndexError, ValueError):
-                await event.respond("Usage: /removeadmin [user_id]")
-
-        @self.bot_client.on(events.NewMessage(pattern='/listadmins'))
-        async def list_admins_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            admins_list = "\n".join([f"👉 {admin_id}" for admin_id in self.admins])
-            await event.respond(
-                f"👑 Owner: {self.owner_id}\n"
-                f"🛡 Admins:\n{admins_list}\n"
-                f"Total: {len(self.admins)} admins ✨"
-            )
-
-        @self.bot_client.on(events.NewMessage(pattern='/send'))
-        async def send_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            if self.check_cooldown(event.sender_id):
-                return
-                
-            if not self.current_message and not self.current_media:
-                await event.respond("❌ No message set! Send me your message first ✨")
-                return
-                
-            if self.broadcast_active:
-                await event.respond("⚠ Broadcast already in progress! ✨")
-                return
-                
-            self.broadcast_active = True
-            self.stop_requested = False
-            self.successful = []
-            self.failed = []
+    async def update_message_views(self):
+        """Update the view count of the original message"""
+        if not self.message_to_forward:
+            return
             
-            await event.respond("🚀 Starting broadcast... ✨✨✨")
-            asyncio.create_task(self.run_broadcast(event.chat_id))
+        try:
+            message = await self.user_client.get_messages(
+                self.message_to_forward[0],
+                ids=self.message_to_forward[1]
+            )
+            if hasattr(message, 'views'):
+                self.stats['original_message_views'] = message.views
+        except Exception as e:
+            logging.error(f"Error updating message views: {str(e)}")
 
-        @self.bot_client.on(events.NewMessage(pattern='/stop'))
-        async def stop_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
+    async def forward_to_group(self, group):
+        try:
+            if not self.message_to_forward:
+                logging.error("No message to forward")
+                return None
                 
-            if not self.broadcast_active:
-                await event.respond("⚠ No active broadcast to stop")
-                return
-                
-            self.stop_requested = True
-            await event.respond("ᴄᴜʀʀᴇɴᴛ ʙʀᴏᴀᴅᴄᴀꜱᴛ ɪꜱ ꜱᴛᴏᴘᴇᴅ 🛑 ʙʏ ᴛʜᴇ ᴜꜱᴇʀ")
-
-        @self.bot_client.on(events.NewMessage(pattern='/status'))
-        async def status_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            status = "📊 Current Status \n\n"
+            # Get the original message
+            original_msg = await self.user_client.get_messages(
+                self.message_to_forward[0],
+                ids=self.message_to_forward[1]
+            )
             
-            if self.broadcast_active:
-                status += "🟢 Broadcast running\n"
+            # Forward the message
+            forwarded = await self.user_client.forward_messages(
+                entity=group['id'],
+                messages=original_msg
+            )
+            
+            if isinstance(forwarded, list):
+                forwarded = forwarded[0]
+                
+            chat = group['entity']
+            if hasattr(chat, 'username') and chat.username:
+                message_link = f"https://t.me/{chat.username}/{forwarded.id}"
             else:
-                status += "🔴 No active broadcast\n"
-                
-            if self.current_flood_wait > 0:
-                status += f"⏳ Waiting {self.current_flood_wait}s (flood control)\n"
-                
-            if self.current_message or self.current_media:
-                status += "\nꜱᴇɴᴅɪɴɢ ᴛᴏ ᴄʜᴀᴛꜱ\n"
-                if self.current_message:
-                    status += f"𝐌𝐄𝐒𝐒𝐀𝐆𝐄 𝐓𝐎 𝐒𝐄𝐍𝐃 : {self.current_message[:50]}...\n"
-                if self.current_media:
-                    status += "📷 Media attached\n"
+                message_link = f"https://t.me/c/{abs(group['id'])}/{forwarded.id}"
             
-            status += f"\n• ᴅᴏɴᴇ : {len(self.successful)}"
-            status += f"\n• ꜰᴀɪʟ : {len(self.failed)}"
+            # Update message views
+            await self.update_message_views()
             
-            await event.respond(status)
+            logging.info(f"Message forwarded to {group['title']}")
+            self.stats['successful_forwards'] += 1
+            self.stats['last_forwarded_group'] = group['title']
+            return message_link
+            
+        except errors.FloodWaitError as e:
+            logging.info(f"Flood wait: {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            return await self.forward_to_group(group)
+        except Exception as e:
+            logging.error(f"Error forwarding to {group['title']}: {str(e)}")
+            self.stats['failed_forwards'] += 1
+            return None
 
-        @self.bot_client.on(events.NewMessage())
-        async def message_handler(event):
-            if not self.is_authorized(event.sender_id):
-                return
-                
-            if event.raw_text.startswith('/'):
-                return
-                
-            self.current_message = event.message.message
-            self.current_media = event.message.media
-            self.current_entities = event.message.entities
+    async def update_stats_message(self):
+        if not self.stats_message:
+            return
             
-            preview = "✅ Message saved!\n"
-            if self.current_message:
-                preview += f"Text: {self.current_message[:100]}\n"
-            if self.current_media:
-                preview += "📷 Media attached\n"
-            
-            has_premium_emoji = any(
-                isinstance(e, MessageEntityCustomEmoji) 
-                for e in (self.current_entities or [])
-            )
-            
-            if has_premium_emoji:
-                preview += "✨ Premium emojis detected!\n"
-            
-            preview += "\nUse /send to broadcast"
-            await event.respond(preview)
-
-    async def run_broadcast(self, report_chat_id):
-        """Execute the broadcast"""
+        stats_text = (
+            f"<b>GODCARING | LIVE STATISTICS</b>\n\n"
+            f"Total Groups: {self.stats['total_groups']}\n"
+            f"Successful Forwards: {self.stats['successful_forwards']}\n"
+            f"Failed Forwards: {self.stats['failed_forwards']}\n"
+            f"Last Forwarded To: {self.stats['last_forwarded_group'] or 'None'}\n"
+            f"Original Message Views: {self.stats['original_message_views']}\n"
+            f"Original Message: {self.stats['original_message_link'] or 'Not set'}\n\n"
+            f"Auto-updating every 10 seconds"
+        )
+        
         try:
-            dialogs = await self.get_valid_chats()
-            total = len(dialogs)
-            
-            await self.bot_client.send_message(
-                report_chat_id, 
-                f"ꜰᴇᴛᴄʜɪɴɢ ᴀʟʟ ᴄʜᴀᴛꜱ ᴛᴏ ꜱᴛᴀʀᴛ ʙʀᴏᴀᴅᴄᴀꜱᴛ 📤"
-            )
-            
-            for i, dialog in enumerate(dialogs, 1):
-                if not self.broadcast_active or self.stop_requested:
-                    await self.bot_client.send_message(
-                        report_chat_id,
-                        "ꜱᴛᴏᴘᴘɪɴɢ ᴛʜᴇ ᴄᴜʀʀᴇɴᴛ ᴘʀᴏᴄᴇꜱꜱ"
-                    )
+            await self.stats_message.edit(stats_text, parse_mode='html')
+        except Exception as e:
+            logging.error(f"Error updating stats: {str(e)}")
+
+    async def promotion_cycle(self):
+        self.running = True
+        self.stats_message = await self.bot.send_message(
+            ADMIN_IDS[0],
+            "<b>GODCARING | INITIATING FORWARDING CYCLE</b>",
+            parse_mode='html'
+        )
+        
+        while self.running:
+            groups = await self.get_all_groups()
+            if not groups:
+                logging.info("No groups available")
+                await asyncio.sleep(SEND_INTERVAL)
+                continue
+                
+            for group in groups:
+                if not self.running:
                     break
                     
-                chat = dialog.entity
-                chat_name = chat.title if hasattr(chat, 'title') else chat.first_name
-                
                 try:
-                    success = await self.safe_send(
-                        chat.id,
-                        self.current_message,
-                        self.current_media,
-                        self.current_entities
+                    message_link = await self.forward_to_group(group)
+                    
+                    if message_link and self.profile_photo:
+                        report = (
+                            f"<b>GODCARING | MESSAGE FORWARD CONFIRMATION</b>\n\n"
+                            f"Group: {group['title']}\n"
+                            f"Type: {group['type']}\n"
+                            f"Link: <a href='{message_link}'>View Forwarded Message</a>\n"
+                            f"Original Views: {self.stats['original_message_views']}"
+                        )
+                        
+                        for admin_id in ADMIN_IDS:
+                            await self.bot.send_file(
+                                admin_id,
+                                file=self.profile_photo,
+                                caption=report,
+                                parse_mode='html'
+                            )
+                    
+                    await self.update_stats_message()
+                    await asyncio.sleep(SEND_INTERVAL)
+                except Exception as e:
+                    logging.error(f"Error processing {group.get('title', 'Unknown')}: {str(e)}")
+                    
+            await asyncio.sleep(10)
+        
+        await self.stats_message.edit(
+            "<b>GODCARING | FORWARDING CYCLE COMPLETED</b>\n\n"
+            f"Final Statistics:\n"
+            f"Total Groups: {self.stats['total_groups']}\n"
+            f"Successful Forwards: {self.stats['successful_forwards']}\n"
+            f"Failed Forwards: {self.stats['failed_forwards']}\n"
+            f"Final Original Message Views: {self.stats['original_message_views']}",
+            parse_mode='html'
+        )
+        self.stats_message = None
+
+    async def show_main_menu(self, event):
+        # Clear any existing state
+        self.user_state.pop(event.sender_id, None)
+        
+        buttons = [
+            [Button.inline("Start Forwarding", b"start_bot")],
+            [Button.inline("Stop Forwarding", b"stop_bot")],
+            [Button.inline("View Statistics", b"status")],
+            [Button.inline("Set Message Link", b"set_message_link")],
+        ]
+        
+        if event.sender_id in ADMIN_IDS:
+            buttons.extend([
+                [Button.inline("Admin Settings", b"admin_settings")],
+                [Button.inline("Change Profile Photo", b"change_photo")]
+            ])
+        
+        if self.profile_photo:
+            await event.respond(
+                " Current Profile Photo:",
+                file=self.profile_photo
+            )
+        
+        await event.respond(
+            "<b>GODCARING | MAIN MENU</b>\n\n"
+            "Select an action:",
+            parse_mode='html',
+            buttons=buttons
+        )
+
+    async def handle_start(self, event):
+        if event.sender_id not in self.authorized_users:
+            return await event.reply("🚫 Unauthorized access")
+            
+        # First ensure we're logged in
+        if not self.initialized:
+            login_success = await self.connect_user_client()
+            if not login_success:
+                return  # We're waiting for verification code
+            
+            # After successful login, proceed with setup
+            
+        # Check if profile photo is set
+        if not self.profile_photo:
+            self.user_state[event.sender_id] = "awaiting_photo"
+            return await event.reply(
+                " Please send the profile photo you want to use for confirmations:",
+                buttons=Button.inline("Cancel", b"main_menu")
+            )
+            
+        # Check if message is set
+        if not self.message_to_forward:
+            self.user_state[event.sender_id] = "awaiting_message_link"
+            return await event.reply(
+                "🔗 Please send the link of the message you want to forward (format: https://t.me/myehra/3):",
+                buttons=Button.inline("Cancel", b"main_menu")
+            )
+            
+        # If both are set, show main menu
+        await self.show_main_menu(event)
+
+    async def handle_main(self, event):
+        if event.sender_id not in self.authorized_users:
+            return await event.reply("🚫 Unauthorized access")
+            
+        await self.show_main_menu(event)
+
+    async def handle_set_photo(self, event):
+        if event.sender_id not in self.authorized_users:
+            return
+            
+        # Check if we're expecting a photo
+        if self.user_state.get(event.sender_id) == "awaiting_photo" or event.sender_id in ADMIN_IDS:
+            self.profile_photo = event.media
+            self.user_state.pop(event.sender_id, None)
+            
+            # If this was the first setup, now ask for message
+            if not self.message_to_forward:
+                self.user_state[event.sender_id] = "awaiting_message_link"
+                await event.reply(
+                    "✅ Profile photo set successfully!\n\n"
+                    "🔗 Now please send the link of the message you want to forward (format: https://t.me/myehra/3):",
+                    buttons=Button.inline("Cancel", b"main_menu")
+                )
+            else:
+                await event.reply(
+                    "✅ Profile photo updated successfully!",
+                    parse_mode='html'
+                )
+                await self.show_main_menu(event)
+
+    async def parse_message_link(self, link):
+        """Parse a Telegram message link in format https://t.me/myehra/3"""
+        try:
+            # Basic validation
+            if not link.startswith('https://t.me/'):
+                return None
+                
+            if link.count('/') != 4:  # https://t.me/myehra/3
+                return None
+                
+            username_part = link.split('/')[-2]
+            message_id = int(link.split('/')[-1])
+            
+            # Resolve username to channel ID
+            entity = await self.user_client.get_entity(username_part)
+            return (entity.id, message_id)
+            
+        except ValueError:
+            logging.error("Invalid message ID in link")
+            return None
+        except Exception as e:
+            logging.error(f"Error parsing link: {str(e)}")
+            return None
+
+    async def handle_set_message_link(self, event):
+        if event.sender_id not in self.authorized_users or event.text.startswith('/'):
+            return
+            
+        user_state = self.user_state.get(event.sender_id)
+        
+        # Handle verification code input
+        if user_state == "awaiting_code":
+            code = event.raw_text.strip()
+            if not code.isdigit() or len(code) != 5:
+                await event.reply("❌ Invalid code format. Please enter a 5-digit verification code.")
+                return
+                
+            login_success = await self.complete_login(code)
+            if login_success:
+                await event.reply("✅ Login successful! Please send /start to continue setup.")
+            return
+            
+        # Handle 2FA password input
+        elif user_state == "awaiting_password":
+            password = event.raw_text.strip()
+            auth_success = await self.complete_2fa(password)
+            if auth_success:
+                await event.reply("✅ 2FA authentication successful! Please send /start to continue setup.")
+            return
+            
+        # Handle message link input
+        elif user_state == "awaiting_message_link":
+            try:
+                link = event.raw_text.strip()
+                message_info = await self.parse_message_link(link)
+                if not message_info:
+                    await event.reply("❌ Invalid message link format. Please use format: https://t.me/myehra/3")
+                    return
+                    
+                self.message_to_forward = message_info
+                self.stats['original_message_link'] = link
+                
+                # Verify the message exists
+                try:
+                    original_msg = await self.user_client.get_messages(
+                        message_info[0],
+                        ids=message_info[1]
                     )
                     
-                    if success:
-                        self.successful.append(chat_name)
-                    else:
-                        self.failed.append((chat_name, "Send failed"))
+                    if hasattr(original_msg, 'views'):
+                        self.stats['original_message_views'] = original_msg.views
                     
-                    if i % 5 == 0 or i == total:
-                        await self.bot_client.send_message(
-                            report_chat_id,
-                            f"ᴘʀᴏᴄᴇꜱꜱɪɴɢ : {i}/{total}\n"
-                            f"• ᴅᴏɴᴇ : {len(self.successful)}\n"
-                            f"• ꜰᴀɪʟ : {len(self.failed)}"
-                        )
-                    
-                    await asyncio.sleep(self.delay_seconds)
-                
+                    preview = original_msg.text[:100] + "..." if original_msg.text else "[Media message]"
                 except Exception as e:
-                    self.failed.append((chat_name, str(e)))
-                    continue
-            
-            if self.broadcast_active and not self.stop_requested:
-                await self.bot_client.send_message(
-                    report_chat_id,
-                    f"ᴍᴇꜱꜱᴀɢᴇ ꜱᴇɴᴛ 📤\n"
-                    f"• ᴅᴏɴᴇ : {len(self.successful)}\n"
-                    f"• ꜰᴀɪʟ : {len(self.failed)}"
+                    preview = "[Could not load message preview]"
+                    logging.error(f"Error getting message preview: {str(e)}")
+                
+                self.user_state.pop(event.sender_id, None)
+                
+                await event.reply(
+                    f"✅ Message link set successfully!\n\n"
+                    f"Preview:\n<code>{preview}</code>\n\n"
+                    f"Original Views: {self.stats['original_message_views']}\n"
+                    "You may now start the forwarding campaign.",
+                    parse_mode='html'
                 )
                 
-        except Exception as e:
-            print(f"Broadcast error: {e}")
-            await self.bot_client.send_message(
-                report_chat_id,
-                f"❌ Broadcast failed: {str(e)[:200]}"
+                await self.show_main_menu(event)
+            except Exception as e:
+                await event.reply(f"Error setting message link: {str(e)}")
+
+    async def handle_admin_commands(self, event):
+        if event.sender_id not in ADMIN_IDS:
+            return await event.reply("❌ Only main admin can use this command")
+            
+        args = event.raw_text.split()
+        
+        if len(args) < 2:
+            return await event.reply(
+                "⚙️ <b>Admin Commands:</b>\n\n"
+                "/admin add [user_id] - Add authorized user\n"
+                "/admin remove [user_id] - Remove authorized user\n"
+                "/admin list - Show authorized users",
+                parse_mode='html'
             )
-        finally:
-            self.broadcast_active = False
-            self.stop_requested = False
-            self.current_flood_wait = 0
+            
+        command = args[1]
+        
+        try:
+            if command == "add" and len(args) > 2:
+                user_id = int(args[2])
+                self.authorized_users.add(user_id)
+                await event.reply(f"✅ User {user_id} added to authorized list")
+                
+            elif command == "remove" and len(args) > 2:
+                user_id = int(args[2])
+                if user_id in self.authorized_users:
+                    self.authorized_users.remove(user_id)
+                    await event.reply(f"✅ User {user_id} removed from authorized list")
+                else:
+                    await event.reply(f"❌ User {user_id} not found in authorized list")
+                    
+            elif command == "list":
+                users_list = "\n".join(str(uid) for uid in self.authorized_users)
+                await event.reply(
+                    f"👥 <b>Authorized Users:</b>\n\n{users_list}",
+                    parse_mode='html'
+                )
+                
+            else:
+                await event.reply("❌ Invalid command")
+                
+        except ValueError:
+            await event.reply("❌ Invalid user ID format")
 
-    async def get_valid_chats(self):
-        valid_chats = []
-        async for dialog in self.user_client.iter_dialogs():
-            if dialog.is_user:
-                if dialog.entity.bot or dialog.entity.id == self.me.id:
-                    continue
-            valid_chats.append(dialog)
-        return valid_chats
+    async def handle_callback(self, event):
+        if event.sender_id not in self.authorized_users:
+            await event.answer("🚫 Unauthorized access", alert=True)
+            return
+            
+        command = event.data.decode('utf-8')
+        
+        if command == "start_bot":
+            if not self.initialized:
+                await event.answer("Please complete login first", alert=True)
+                return
+                
+            if self.running:
+                await event.answer("Forwarding is already running", alert=True)
+                return
+                
+            if not self.message_to_forward:
+                await event.answer("No message link set. Please set a message link first", alert=True)
+                return
+                
+            if not self.profile_photo:
+                await event.answer("No profile photo set. Please set a photo first", alert=True)
+                return
+                
+            try:
+                self.stats = {
+                    'total_groups': 0,
+                    'successful_forwards': 0,
+                    'failed_forwards': 0,
+                    'last_forwarded_group': None,
+                    'original_message_views': 0,
+                    'original_message_link': self.stats['original_message_link']
+                }
+                
+                asyncio.create_task(self.promotion_cycle())
+                
+                await event.edit(
+                    "<b>GODCARING | FORWARDING INITIATED</b>\n\n"
+                    f"Original Message: {self.stats['original_message_link']}\n"
+                    f"Initial Views: {self.stats['original_message_views']}\n"
+                    f"Interval: {SEND_INTERVAL} seconds\n\n"
+                    "You will receive live statistics shortly.",
+                    parse_mode='html',
+                    buttons=Button.inline("Back to Menu", b"main_menu")
+                )
+            except Exception as e:
+                await event.answer(f"Error: {str(e)}", alert=True)
+                
+        elif command == "stop_bot":
+            if not self.running:
+                await event.answer("No active forwarding running", alert=True)
+                return
+                
+            self.running = False
+            await event.edit(
+                "<b>GODCARING | FORWARDING TERMINATED</b>",
+                parse_mode='html',
+                buttons=Button.inline("Back to Menu", b"main_menu")
+            )
+            
+        elif command == "status":
+            status = "ACTIVE" if self.running else "INACTIVE"
+            
+            status_message = (
+                f"<b>GODCARING | FORWARDING STATUS</b>\n\n"
+                f"Status: {status}\n"
+                f"Original Message: {self.stats['original_message_link'] or 'Not set'}\n"
+                f"Original Views: {self.stats['original_message_views']}\n"
+                f"Profile Photo: {'SET' if self.profile_photo else 'NOT SET'}\n"
+            )
+            
+            if self.message_to_forward:
+                try:
+                    original_msg = await self.user_client.get_messages(
+                        self.message_to_forward[0],
+                        ids=self.message_to_forward[1]
+                    )
+                    preview = original_msg.text[:100] + "..." if original_msg.text else "[Media message]"
+                except:
+                    preview = "[Could not load message]"
+                
+                status_message += f"\nPreview:\n<code>{preview}</code>"
+            
+            await event.edit(
+                status_message,
+                parse_mode='html',
+                buttons=Button.inline("Back to Menu", b"main_menu")
+            )
+            
+        elif command == "set_message_link":
+            if not self.initialized:
+                await event.answer("Please complete login first", alert=True)
+                return
+                
+            self.user_state[event.sender_id] = "awaiting_message_link"
+            await event.edit(
+                "🔗 Please send the link of the message you want to forward (format: https://t.me/myehra/3):",
+                buttons=Button.inline("Cancel", b"main_menu")
+            )
+            
+        elif command == "main_menu":
+            await self.show_main_menu(event)
+            
+        elif command == "admin_settings":
+            if event.sender_id not in ADMIN_IDS:
+                await event.answer("Only main admin can access these settings", alert=True)
+                return
+                
+            buttons = [
+                [Button.inline("Add User", b"add_user")],
+                [Button.inline("Remove User", b"remove_user")],
+                [Button.inline("List Users", b"list_users")],
+                [Button.inline("Back to Menu", b"main_menu")]
+            ]
+            
+            await event.edit(
+                "<b>ADMIN SETTINGS</b>\n\n"
+                "Manage authorized users for this bot:",
+                parse_mode='html',
+                buttons=buttons
+            )
+            
+        elif command == "change_photo":
+            if event.sender_id not in ADMIN_IDS:
+                await event.answer("Only admin can change photo", alert=True)
+                return
+                
+            self.user_state[event.sender_id] = "awaiting_photo"
+            await event.edit(
+                "📸 Send me a new profile photo:",
+                buttons=Button.inline("Cancel", b"main_menu")
+            )
+            
+        elif command == "add_user":
+            await event.edit(
+                "Send the user ID to add as authorized:\n"
+                "(Reply to this message with /admin add [user_id])",
+                buttons=Button.inline("Back to Admin", b"admin_settings")
+            )
+            
+        elif command == "remove_user":
+            await event.edit(
+                "Send the user ID to remove from authorized:\n"
+                "(Reply to this message with /admin remove [user_id])",
+                buttons=Button.inline("Back to Admin", b"admin_settings")
+            )
+            
+        elif command == "list_users":
+            users_list = "\n".join(str(uid) for uid in self.authorized_users)
+            await event.edit(
+                f"<b>Authorized Users:</b>\n\n{users_list}",
+                parse_mode='html',
+                buttons=Button.inline("Back to Admin", b"admin_settings")
+            )
+            
+        await event.answer()
 
-if __name__ == '__main__':
-    os.system('clear')
-    print("𝗦𝗧𝗔𝗥𝗧𝗜𝗡𝗚 𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗕𝗥𝗢𝗔𝗗𝗖𝗔𝗦𝗧 𝗕𝗢𝗧 ")
-    
-    bot = BroadcastBot()
+    async def run(self):
+        await self.bot.start()
+        logging.info("@GODSERVICEBOT is operational")
+        await self.bot.run_until_disconnected()
+
+if __name__ == "__main__":
+    bot = TelegramBot()
     try:
-        asyncio.run(bot.initialize())
+        asyncio.get_event_loop().run_until_complete(bot.run())
     except KeyboardInterrupt:
-        print("\nᴄᴜʀʀᴇɴᴛ ʙʀᴏᴀᴅᴄᴀꜱᴛ ɪꜱ ꜱᴛᴏᴘᴇᴅ 🛑 ʙʏ ᴛʜᴇ ᴜꜱᴇʀ")
+        logging.info("Service terminated")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        logging.error(f"System error: {str(e)}")
